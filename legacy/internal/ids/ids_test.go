@@ -63,9 +63,29 @@ func TestHeaderPrecedenceOverConversationSeed(t *testing.T) {
 	}
 }
 
+func TestCanonicalSessionID(t *testing.T) {
+	signal := "test-signal"
+	generated := CanonicalSessionID(signal)
+	if !canonicalSessionPattern.MatchString(generated) {
+		t.Fatalf("expected canonical pattern, got %s", generated)
+	}
+	if CanonicalSessionID(signal) != generated {
+		t.Fatalf("CanonicalSessionID must be deterministic")
+	}
+	validCanonical := "ses_0123456789abCdefGhijklmnOP"
+	if CanonicalSessionID(validCanonical) != validCanonical {
+		t.Fatalf("valid canonical session should be preserved")
+	}
+	legacySession := "ses_39821135cab0b58e72758117"
+	converted := CanonicalSessionID(legacySession)
+	if converted == legacySession || !canonicalSessionPattern.MatchString(converted) {
+		t.Fatalf("legacy session must be converted to canonical format, got %s", converted)
+	}
+}
+
 func TestUserAgentShape(t *testing.T) {
 	ua := opencodeUserAgent()
-	if !strings.HasPrefix(ua, "opencode/1.18.21 (") {
+	if !strings.HasPrefix(ua, "opencode/1.18.31 (") {
 		t.Fatalf("unexpected user agent: %s", ua)
 	}
 }

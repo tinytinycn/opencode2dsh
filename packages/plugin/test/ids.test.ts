@@ -1,7 +1,34 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { conversationSeed, deriveRequestIDs, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../src/adapter/ids.ts'
+import {
+  canonicalSessionID,
+  canonicalSessionPattern,
+  conversationSeed,
+  deriveRequestIDs,
+  disguiseHeaders,
+  opencodeUserAgent,
+  randomID,
+  stableID,
+} from '../src/adapter/ids.ts'
+
+test('canonicalSessionID produces OpenCode-canonical session shape and preserves valid sessions', () => {
+  const signal = 'test-signal'
+  const generated = canonicalSessionID(signal)
+  assert.ok(canonicalSessionPattern.test(generated), `expected ${generated} to match canonical pattern`)
+  assert.equal(generated, canonicalSessionID(signal), 'deterministic for identical signal')
+  assert.notEqual(generated, canonicalSessionID('other-signal'), 'different signals yield different sessions')
+
+  // Already canonical sessions are preserved as-is
+  const validCanonical = 'ses_0123456789abCdefGhijklmnOP'
+  assert.equal(canonicalSessionID(validCanonical), validCanonical)
+
+  // Non-canonical formats (e.g. legacy 24-hex sessions or UUIDs) get hashed into canonical shape
+  const legacySession = 'ses_39821135cab0b58e72758117'
+  const converted = canonicalSessionID(legacySession)
+  assert.notEqual(converted, legacySession)
+  assert.ok(canonicalSessionPattern.test(converted))
+})
 
 test('stableID is deterministic and sha256-truncated', () => {
   const first = stableID('ses', 'hello')
@@ -47,6 +74,7 @@ test('deriveRequestIDs keeps the session stable across turns and randomizes requ
   const first = deriveRequestIDs(turnOne)
   const second = deriveRequestIDs(turnTwo)
   assert.equal(first.session, second.session)
+  assert.ok(canonicalSessionPattern.test(first.session))
   assert.notEqual(first.request, second.request)
   assert.equal(first.project, second.project)
   assert.ok(first.project.startsWith('prj_'))
@@ -54,6 +82,7 @@ test('deriveRequestIDs keeps the session stable across turns and randomizes requ
   // fallback: no user content at all still yields usable ids
   const empty = deriveRequestIDs([{ role: 'system', content: 'only system' }])
   assert.ok(empty.session.startsWith('ses_'))
+  assert.ok(canonicalSessionPattern.test(empty.session))
   assert.notEqual(empty.session, deriveRequestIDs([{ role: 'system', content: 'only system' }]).session)
 })
 
@@ -67,6 +96,6 @@ test('disguiseHeaders carries the CLI-identical correlation set', () => {
   assert.equal(headers['X-Session-Id'], ids.session)
   assert.equal(headers['x-opencode-request'], ids.request)
   assert.equal(headers['x-opencode-project'], ids.project)
-  assert.ok(headers['user-agent'].startsWith('opencode/'))
+  assert.ok(headers['user-agent'].startsWith('opencode/1.18.31 ('))
   assert.ok(headers['user-agent'].includes(process.platform))
 })

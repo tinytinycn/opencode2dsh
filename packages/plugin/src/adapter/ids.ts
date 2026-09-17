@@ -46,6 +46,38 @@ export function conversationSeed(messages: Array<{ role: string; content: unknow
   return ''
 }
 
+// canonicalSessionPattern matches OpenCode's canonical session format:
+// "ses_" + 12 lowercase hex timestamp characters + 14 Base62 characters.
+// Since 2026-09-16 the Zen free tier (Authorization: Bearer public) rejects
+// any other session shape with 403 FreeTierError.
+export const canonicalSessionPattern = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+
+const base62Alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+
+/**
+ * CanonicalSessionID returns signal unchanged when it already carries an
+ * official OpenCode session (preserving upstream prompt-cache affinity).
+ * Any other downstream identity (UUIDs, foreign client sessions, legacy
+ * gateway sessions, conversation seeds) is deterministically hashed into the
+ * canonical shape so the same conversation keeps a stable session.
+ */
+export function canonicalSessionID(signal: string): string {
+  if (canonicalSessionPattern.test(signal)) {
+    return signal
+  }
+  const sum = createHash('sha256').update('ses\x00' + signal).digest()
+  const timePart = sum.subarray(0, 6).toString('hex')
+  let n = BigInt('0x' + sum.subarray(6, 16).toString('hex'))
+  const base = 62n
+  const out = new Array<string>(14)
+  for (let i = 13; i >= 0; i--) {
+    const rem = Number(n % base)
+    n = n / base
+    out[i] = base62Alphabet[rem]!
+  }
+  return 'ses_' + timePart + out.join('')
+}
+
 /**
  * Derive the correlation ids for one upstream request. In adapter mode there
  * are no inbound opencode headers, so the seed is the conversation itself.
@@ -54,7 +86,7 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
   let signal = conversationSeed(messages)
   if (signal === '' || signal === '{}') signal = randomID('fallback', 16)
   return {
-    session: stableID('ses', signal),
+    session: canonicalSessionID(signal),
     request: randomID('req', 16),
     project: stableID('prj', 'opencode2dsh:default-project'),
     parentSession: '',
@@ -63,7 +95,7 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
 
 /** CLI-identical user agent (ids.go opencodeUserAgent, node runtime values). */
 export function opencodeUserAgent(): string {
-  return `opencode/1.18.21 (${process.platform} ${process.arch}; node${process.versions.node})`
+  return `opencode/1.18.31 (${process.platform} ${process.arch}; node${process.versions.node})`
 }
 
 /**

@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
+	"regexp"
 	"runtime"
 	"strings"
 )
@@ -39,7 +41,7 @@ func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
 	if signal == "" || signal == `{}` {
 		signal = randomID("fallback", 16)
 	}
-	session := stableID("ses", signal)
+	session := CanonicalSessionID(signal)
 	projectSignal := firstString(r.Header.Get("x-opencode-project"), stringAt(body, "metadata", "project_id"))
 	if projectSignal == "" {
 		projectSignal = "opencode2api:default-project"
@@ -97,6 +99,40 @@ func firstString(values ...string) string {
 	return ""
 }
 
+// canonicalSessionPattern matches OpenCode's canonical session format:
+// "ses_" + 12 lowercase hex timestamp characters + 14 Base62 characters.
+// Since 2026-09-16 the Zen free tier (Authorization: Bearer public) rejects
+// any other session shape with 403 FreeTierError.
+var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// CanonicalSessionID returns signal unchanged when it already carries an
+// official OpenCode session (preserving upstream prompt-cache affinity).
+// Any other downstream identity (UUIDs, foreign client sessions, legacy
+// gateway sessions, conversation seeds) is deterministically hashed into the
+// canonical shape so the same conversation keeps a stable session.
+func CanonicalSessionID(signal string) string {
+	if canonicalSessionPattern.MatchString(signal) {
+		return signal
+	}
+	sum := sha256.Sum256([]byte("ses\x00" + signal))
+	timePart := hex.EncodeToString(sum[:6])
+	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
+	return "ses_" + timePart + randomPart
+}
+
+func base62Fixed(n *big.Int, width int) string {
+	base := big.NewInt(62)
+	out := make([]byte, width)
+	remainder := new(big.Int)
+	for i := width - 1; i >= 0; i-- {
+		n.DivMod(n, base, remainder)
+		out[i] = base62Alphabet[remainder.Int64()]
+	}
+	return string(out)
+}
+
 func opencodeUserAgent() string {
-	return fmt.Sprintf("opencode/1.18.21 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
+	return fmt.Sprintf("opencode/1.18.31 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
 }

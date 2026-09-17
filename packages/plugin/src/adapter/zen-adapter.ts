@@ -1,5 +1,13 @@
-import { createProvider, type Api, type Context, type Model } from '@earendil-works/pi-ai'
+import {
+  createProvider,
+  type Api,
+  type Context,
+  type Model,
+  type ThinkingLevel,
+  type ThinkingLevelMap,
+} from '@earendil-works/pi-ai'
 import * as openaiCompletions from '@earendil-works/pi-ai/api/openai-completions'
+import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 
 import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
 import { toStreamChunks, type HarnessChunk, type PiEvent } from './events.ts'
@@ -11,15 +19,29 @@ import { classifyStreamFailure, isRegionBlocked, shouldRotate } from '../pool/ro
 /**
  * The TS adapter: registers as a DSH LlmAdapter for the `opencode2dsh` route
  * and streams directly from the OpenCode Zen anonymous lane. The wire layer is
- * pi-ai's openai-completions implementation (the same one DSH uses for every
- * OpenAI-compatible provider); this module adds the CLI disguise headers, the
- * derived session/request ids, and the free-model catalog.
+ * pi-ai's openai-completions / openai-responses implementation (the same one
+ * DSH uses for every OpenAI-compatible provider); this module adds the CLI disguise
+ * headers, the derived session/request ids, and the free-model catalog.
  *
  * Adapter contract: dsh-llm LlmAdapter (providerInfo/listModels/resolveModel/
  * prepareCall/stream) — structural, no host import.
  */
 
 export const PROVIDER_ID = 'opencode2dsh'
+
+/**
+ * Responses-only models: muse-spark-* fail with bare 500 on /chat/completions,
+ * but succeed (200) on /responses. They route to pi-ai's openai-responses api.
+ */
+export const RESPONSES_ONLY_PREFIX = 'muse-spark-'
+
+export function isResponsesOnlyModel(modelId: string): boolean {
+  return modelId.startsWith(RESPONSES_ONLY_PREFIX)
+}
+
+export function apiForModel(modelId: string): 'openai-responses' | 'openai-completions' {
+  return isResponsesOnlyModel(modelId) ? 'openai-responses' : 'openai-completions'
+}
 
 export interface ZenModelInfo {
   id: string
@@ -52,13 +74,15 @@ export const WATCHDOG_IDLE_MESSAGE = 'opencode2dsh: stream body idle timeout (ex
 /** Default watchdog windows (docs/ip-pool.md; test-injectable via constructor). */
 export const DEFAULT_FIRST_EVENT_MS = 30_000
 export const DEFAULT_BODY_IDLE_MS = 120_000
+/** Widened body idle window for reasoning burstiness in responses-only models. */
+export const RESPONSES_BODY_IDLE_MS = 300_000
 
 /** The terminal error event pi-ai owes but never sent (watchdog teardown). */
 function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
   return {
     type: 'error',
     error: {
-      api: 'openai-completions',
+      api: model.api,
       provider: PROVIDER_ID,
       model: model.id,
       content: [],
@@ -69,14 +93,33 @@ function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
   }
 }
 
+/**
+ * Supported reasoning effort mapping for responses-only models (e.g. muse-spark-*).
+ * Upstream provider (Console) rejects reasoning_effort: 'none'.
+ * Supported values: [minimal, low, medium, high, xhigh, max].
+ * Mapping 'off' to null tells pi-ai that disabling reasoning is unsupported,
+ * preventing pi-ai from emitting reasoning: { effort: 'none' } when reasoning is omitted or off.
+ */
+export const RESPONSES_THINKING_MAP: ThinkingLevelMap = {
+  off: null,
+  minimal: 'minimal',
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  xhigh: 'xhigh',
+  max: 'max',
+}
+
 function toPiModel(id: string, contextWindow = DEFAULT_CONTEXT_WINDOW, maxTokens = DEFAULT_MAX_TOKENS): Model<Api> {
+  const isResponses = isResponsesOnlyModel(id)
   return {
     id,
     name: id,
-    api: 'openai-completions',
+    api: isResponses ? 'openai-responses' : 'openai-completions',
     provider: PROVIDER_ID,
     baseUrl: `${ZEN_BASE_URL.replace(/\/+$/, '')}/v1`,
-    reasoning: false,
+    reasoning: isResponses,
+    ...(isResponses ? { thinkingLevelMap: RESPONSES_THINKING_MAP } : {}),
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
@@ -89,6 +132,7 @@ export class ZenAdapter {
   readonly #provider: { streamSimple(model: unknown, context: unknown, options: unknown): unknown }
   readonly #firstEventMs: number
   readonly #bodyIdleMs: number
+  readonly #responsesBodyIdleMs: number
 
   constructor(catalog: CatalogLike, options: {
     zenBaseUrl?: string
@@ -96,10 +140,12 @@ export class ZenAdapter {
     /** Watchdog windows (tests inject short ones; defaults are live-tuned). */
     firstEventMs?: number
     bodyIdleMs?: number
+    responsesBodyIdleMs?: number
   } = {}) {
     this.#catalog = catalog
     this.#firstEventMs = options.firstEventMs ?? DEFAULT_FIRST_EVENT_MS
     this.#bodyIdleMs = options.bodyIdleMs ?? DEFAULT_BODY_IDLE_MS
+    this.#responsesBodyIdleMs = options.responsesBodyIdleMs ?? (options.bodyIdleMs !== undefined ? options.bodyIdleMs : RESPONSES_BODY_IDLE_MS)
     if (options.providerOverride !== undefined) {
       this.#provider = options.providerOverride as never
       return
@@ -116,7 +162,10 @@ export class ZenAdapter {
         },
       },
       models: [],
-      api: openaiCompletions,
+      api: {
+        'openai-completions': openaiCompletions,
+        'openai-responses': openaiResponses,
+      },
     })
   }
 
@@ -203,7 +252,9 @@ export class ZenAdapter {
     // behind the pending request), so timeout-promise racing is the only
     // mechanism that actually interrupts a hung stream.
     const firstEventMs = this.#firstEventMs
-    const bodyIdleMs = this.#bodyIdleMs
+    const bodyIdleMs = isResponsesOnlyModel(options.model)
+      ? this.#responsesBodyIdleMs
+      : this.#bodyIdleMs
     const rotateStory: string[] = []
     for (let attempt = 0; ; attempt += 1) {
       const events = routingContext.run(contextStore, () =>
@@ -363,6 +414,16 @@ export class ZenAdapter {
     ids: ReturnType<typeof deriveRequestIDs>,
     model: ReturnType<typeof toPiModel>,
   ): unknown {
+    const isResponses = isResponsesOnlyModel(model.id)
+    const rawReasoning = options.reasoningEffort ?? options.reasoning
+    let reasoning: ThinkingLevel | undefined
+    if (typeof rawReasoning === 'string') {
+      if (rawReasoning === 'none' || rawReasoning === 'off') {
+        reasoning = isResponses ? 'minimal' : undefined
+      } else {
+        reasoning = rawReasoning as ThinkingLevel
+      }
+    }
     // Structural boundary: PiContext (own types, unit-tested) -> pi-ai Context.
     return this.#provider.streamSimple(model, context as unknown as Context, {
       apiKey: ANONYMOUS_KEY,
@@ -372,6 +433,21 @@ export class ZenAdapter {
       maxRetries: 0,
       temperature: options.temperature,
       maxTokens: options.maxTokens,
+      ...(reasoning ? { reasoning } : {}),
+      onPayload: (payload: unknown) => {
+        if (payload && typeof payload === 'object') {
+          const p = payload as { reasoning?: { effort?: string; [k: string]: unknown }; reasoning_effort?: string }
+          if (isResponsesOnlyModel(model.id)) {
+            if (p.reasoning?.effort === 'none' || p.reasoning?.effort === 'off') {
+              p.reasoning.effort = 'minimal'
+            }
+            if (p.reasoning_effort === 'none' || p.reasoning_effort === 'off') {
+              p.reasoning_effort = 'minimal'
+            }
+          }
+        }
+        return payload
+      },
     })
   }
 

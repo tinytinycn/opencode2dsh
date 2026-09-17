@@ -1,21 +1,8 @@
-# Changelog
+# 更新日志 (Changelog)
 
 ## 0.3.3 (2026-09-18)
 
-### English
-
-#### Fixed
-
-- **Fix sessionID generation format (aligned with PR #28).**
-  Updated `canonicalSessionID` generation to match the canonical format `ses_[0-9a-f]{12}[0-9A-Za-z]{14}` (12 lowercase hex characters followed by 14 alphanumeric characters). Aligned across both Go (`legacy`) and TypeScript (`packages/plugin`) implementations with comprehensive test coverage.
-- **Support responses-only model routing and extended idle watchdog (`muse-spark-*`).**
-  Routed `muse-spark-*` models to pi-ai's `openai-responses` (`/v1/responses`) API to avoid bare 500 errors on `/chat/completions`. Extended stream body idle watchdog from 120s to 300s to accommodate reasoning bursts.
-- **Fix 400 invalid request error for `muse-spark-*` (`reasoning_effort 'none' is not supported`).**
-  Resolved an issue where pi-ai injected `reasoning: { effort: 'none' }` when reasoning was omitted or toggled off, which is rejected by upstream Console for reasoning models. Added `thinkingLevelMap` with `off: null` and `[minimal, low, medium, high, xhigh, max]` support, clamped `none`/`off` to `'minimal'`, and added an `onPayload` sanitization hook to prevent invalid reasoning efforts.
-
-### 中文
-
-#### 修复
+### 修复 (Fixed)
 
 - **修复 sessionID 格式生成问题（对齐 PR #28）。**
   修复 `canonicalSessionID` 生成格式，更新为 `ses_[0-9a-f]{12}[0-9A-Za-z]{14}`（`ses_` 前缀加 12 位小写十六进制，后接 14 位大小写字母数字），对齐 OpenCode 上游会话规范，并在 Go（`legacy`）与 TypeScript 双端均保持一致并补齐单测。
@@ -26,7 +13,7 @@
 
 ## 0.3.1 (2026-09-11)
 
-### Fixed
+### 修复 (Fixed)
 
 - **旧版 DSH 上插件加载失败的问题（用户反馈 `list slot "settings.plugin.item" requires options.id`）。**
   `settings.plugin.item` 槽位在 DSH 0.1.0-rc.7 起由 list（按 `id` 注册）改为 keyed
@@ -37,9 +24,9 @@
 
 ## 0.3.0 (2026-09-09)
 
-The release where the IP pool actually works.
+让 IP 池真正发挥作用的版本。
 
-### Fixed
+### 修复 (Fixed)
 
 - **模型流量现在真正经过 IP 池。** 此前 Node 内置 fetch 与插件所用 undici
   是两个隔离实例，池开启后模型请求仍然直连、路由从未生效。现在开启
@@ -55,7 +42,7 @@ The release where the IP pool actually works.
   补齐；此前免费源候选全部被误拒。
 - **池首次攒到出口后自动启用路由**，无需再手动改一次设置来触发。
 
-### Added
+### 新增 (Added)
 
 - **免费代理源从 26 个扩展到 48 个**，全部逐个实测可用后接入，每轮
   候选量约提升 75%。

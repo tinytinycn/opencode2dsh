@@ -19,7 +19,7 @@
 import type { Dispatcher } from 'undici'
 
 import { ZEN_BASE_URL } from '../adapter/catalog.ts'
-import { disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
+import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
 import { gradeOf, type ExitNode, type ExitPool } from './pool.ts'
 
 export interface AdmissionDeps {
@@ -197,7 +197,7 @@ export async function admitCandidate(
   // Per-candidate ids: the upstream correlates sessions with exits, so a
   // probe session must not collide with real adapter sessions.
   const probeHeaders = disguiseHeaders({
-    session: stableID('ses', `admission:${candidate.address}`),
+    session: canonicalSessionID(`admission:${candidate.address}`),
     request: randomID('req', 16),
     project: stableID('prj', 'opencode2dsh:default-project'),
     parentSession: '',

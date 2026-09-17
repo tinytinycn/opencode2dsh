@@ -32,6 +32,7 @@ export interface HarnessGenerateOptions {
   maxTokens?: number
   temperature?: number
   reasoningEffort?: string
+  reasoning?: string
   signal?: AbortSignal
   [key: string]: unknown
 }
@@ -42,7 +43,7 @@ export type PiMessage =
   | {
       role: 'assistant'
       content: PiAssistantBlock[]
-      api: 'openai-completions'
+      api: 'openai-completions' | 'openai-responses'
       provider: string
       model: string
       usage: PiUsage
@@ -120,12 +121,14 @@ function toPiAssistant(message: HarnessMessage, providerId: string): Extract<PiM
     }
   }
   const source = message.source
+  const model = source?.kind === 'model' && typeof source.model === 'string' ? source.model : providerId
+  const api = model.startsWith('muse-spark-') ? 'openai-responses' : 'openai-completions'
   return {
     role: 'assistant',
     content,
-    api: 'openai-completions',
+    api,
     provider: source?.kind === 'model' && typeof source.provider === 'string' ? source.provider : providerId,
-    model: source?.kind === 'model' && typeof source.model === 'string' ? source.model : providerId,
+    model,
     usage: zeroUsage(),
     stopReason: content.some((block) => block.type === 'toolCall') ? 'toolUse' : 'stop',
     timestamp: 0,
