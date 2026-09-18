@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.4 (2026-09-18)
+
+### Fixed
+
+- **Responses-only 模型路由与思考参数适配（`muse-spark-*`）：**
+  - 将 `muse-spark-*` 模型自动路由至 pi-ai 的 `openai-responses`（`/v1/responses`）API，解决其在 `/chat/completions` 端点返回裸 500 错误的问题。
+  - 将 responses 模型的流式传输 Body 空闲等待超时窗口从 120 秒放宽至 300 秒（`RESPONSES_BODY_IDLE_MS = 300_000`），以容纳深度思考阶段的阵发性静默。
+  - 适配 Responses API 规范，将用户选择的思考等级（Minimal/Medium/High 等）注入至 `reasoning.effort` 对象而非根字段 `reasoning_effort`（避免上游报错 `unknown parameter reasoning_effort`）；在未选择思考等级（Default）时阻止 pi-ai 默认插入 `effort: 'none'`，避免上游因不支持 `'none'` 而报错。
+
 ## 0.3.3 (2026-09-18)
 
 ### Added

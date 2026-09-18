@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ModelCatalog } from '../src/adapter/catalog.ts'
-import { PROVIDER_ID, reasoningEfforts, reasoningEffortWire, ZenAdapter } from '../src/adapter/zen-adapter.ts'
+import { apiForModel, isResponsesOnlyModel, PROVIDER_ID, reasoningEfforts, reasoningEffortWire, RESPONSES_BODY_IDLE_MS, ZenAdapter } from '../src/adapter/zen-adapter.ts'
 
 /**
  * The exact method surface dsh-llm touches on a registered adapter. A missing
@@ -170,4 +170,107 @@ test('stream keeps the free-lane gate rewrite alongside the effort injection', a
 
   // non-chat payloads pass through untouched even with an effort selected
   assert.equal(offOptions.onPayload?.(null), undefined)
+})
+
+test('responses-only models (muse-spark-*) route to openai-responses api', async () => {
+  let capturedModel: any
+  const fakeProvider = {
+    streamSimple: (model: unknown) => {
+      capturedModel = model
+      return (async function* () {
+        yield { type: 'start', partial: { content: [] } }
+        yield { type: 'text_delta', contentIndex: 0, delta: 'regular output' }
+        yield {
+          type: 'done',
+          message: {
+            api: (model as any).api,
+            provider: 'opencode2dsh',
+            model: (model as any).id,
+            content: [{ type: 'text', text: 'regular output' }],
+            usage: { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 10 },
+            stopReason: 'stop',
+          },
+        }
+      })()
+    },
+  }
+  const adapter = new ZenAdapter(new ModelCatalog(), { providerOverride: fakeProvider })
+  const stream = adapter.stream({
+    provider: 'opencode2dsh',
+    model: 'muse-spark-1.3-contributor',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+  })
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  assert.equal(capturedModel.id, 'muse-spark-1.3-contributor')
+  assert.equal(capturedModel.api, 'openai-responses')
+})
+
+test('extended stream body idle watchdog for responses-only models', () => {
+  assert.equal(RESPONSES_BODY_IDLE_MS, 300_000)
+  assert.equal(isResponsesOnlyModel('muse-spark-1.3-contributor'), true)
+  assert.equal(isResponsesOnlyModel('big-pickle'), false)
+  assert.equal(apiForModel('muse-spark-1.3-contributor'), 'openai-responses')
+  assert.equal(apiForModel('big-pickle'), 'openai-completions')
+})
+
+test('responses-only models route reasoning effort to reasoning.effort and never send root reasoning_effort or effort "none"', async () => {
+  let capturedOptions: any
+  const fakeProvider = {
+    streamSimple: (_model: unknown, _context: unknown, options: unknown) => {
+      capturedOptions = options
+      return (async function* () {
+        yield { type: 'start', partial: { content: [] } }
+        yield { type: 'done', message: { content: [], usage: {}, stopReason: 'stop' } }
+      })()
+    },
+  }
+  const adapter = new ZenAdapter(new ModelCatalog(), { providerOverride: fakeProvider })
+
+  // Case 1: user selects Minimal -> reasoning.effort = 'minimal', no root reasoning_effort
+  const streamMinimal = adapter.stream({
+    provider: 'opencode2dsh',
+    model: 'muse-spark-1.3-contributor',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
+    reasoningEffort: 'minimal',
+  })
+  for await (const _ of streamMinimal) {}
+  const payloadMinimal = capturedOptions.onPayload({ stream: true })
+  assert.equal(payloadMinimal.reasoning_effort, undefined)
+  assert.deepEqual(payloadMinimal.reasoning, { effort: 'minimal' })
+
+  // Case 2: user selects High -> reasoning.effort = 'high', no root reasoning_effort
+  const streamHigh = adapter.stream({
+    provider: 'opencode2dsh',
+    model: 'muse-spark-1.3-contributor',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
+    reasoningEffort: 'high',
+  })
+  for await (const _ of streamHigh) {}
+  const payloadHigh = capturedOptions.onPayload({ stream: true })
+  assert.equal(payloadHigh.reasoning_effort, undefined)
+  assert.deepEqual(payloadHigh.reasoning, { effort: 'high' })
+
+  // Case 3: user selects Off -> clamped to 'minimal' because upstream rejects 'none'
+  const streamOff = adapter.stream({
+    provider: 'opencode2dsh',
+    model: 'muse-spark-1.3-contributor',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
+    reasoningEffort: 'off',
+  })
+  for await (const _ of streamOff) {}
+  const payloadOff = capturedOptions.onPayload({ stream: true })
+  assert.equal(payloadOff.reasoning_effort, undefined)
+  assert.deepEqual(payloadOff.reasoning, { effort: 'minimal' })
+
+  // Case 4: user selects default (no reasoningEffort) -> pi-ai's reasoning.effort: 'none' is stripped!
+  const streamDefault = adapter.stream({
+    provider: 'opencode2dsh',
+    model: 'muse-spark-1.3-contributor',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
+  })
+  for await (const _ of streamDefault) {}
+  const payloadDefault = capturedOptions.onPayload({ stream: true, reasoning: { effort: 'none' } })
+  assert.equal(payloadDefault.reasoning_effort, undefined)
+  assert.equal(payloadDefault.reasoning, undefined)
 })

@@ -1,5 +1,6 @@
 import { createProvider, type Api, type Context, type Model } from '@earendil-works/pi-ai'
 import * as openaiCompletions from '@earendil-works/pi-ai/api/openai-completions'
+import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 
 import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
 import { toStreamChunks, type HarnessChunk, type PiEvent } from './events.ts'
@@ -20,6 +21,20 @@ import { classifyStreamFailure, isRegionBlocked, shouldRotate } from '../pool/ro
  */
 
 export const PROVIDER_ID = 'opencode2dsh'
+
+/**
+ * Responses-only models: muse-spark-* fail with bare 500 on /chat/completions,
+ * but succeed (200) on /responses. They route to pi-ai's openai-responses api.
+ */
+export const RESPONSES_ONLY_PREFIX = 'muse-spark-'
+
+export function isResponsesOnlyModel(modelId: string): boolean {
+  return modelId.startsWith(RESPONSES_ONLY_PREFIX)
+}
+
+export function apiForModel(modelId: string): 'openai-responses' | 'openai-completions' {
+  return isResponsesOnlyModel(modelId) ? 'openai-responses' : 'openai-completions'
+}
 
 export interface ZenModelInfo {
   id: string
@@ -112,13 +127,15 @@ export const WATCHDOG_IDLE_MESSAGE = 'opencode2dsh: stream body idle timeout (ex
 /** Default watchdog windows (docs/ip-pool.md; test-injectable via constructor). */
 export const DEFAULT_FIRST_EVENT_MS = 30_000
 export const DEFAULT_BODY_IDLE_MS = 120_000
+/** Widened body idle window for reasoning burstiness in responses-only models. */
+export const RESPONSES_BODY_IDLE_MS = 300_000
 
 /** The terminal error event pi-ai owes but never sent (watchdog teardown). */
 function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
   return {
     type: 'error',
     error: {
-      api: 'openai-completions',
+      api: model.api,
       provider: PROVIDER_ID,
       model: model.id,
       content: [],
@@ -130,10 +147,11 @@ function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
 }
 
 function toPiModel(id: string, reasoning: boolean): Model<Api> {
+  const isResponses = isResponsesOnlyModel(id)
   return {
     id,
     name: id,
-    api: 'openai-completions',
+    api: isResponses ? 'openai-responses' : 'openai-completions',
     provider: PROVIDER_ID,
     baseUrl: `${ZEN_BASE_URL.replace(/\/+$/, '')}/v1`,
     // The honest capability flag: gates pi-ai's reasoning_effort branch and
@@ -141,6 +159,7 @@ function toPiModel(id: string, reasoning: boolean): Model<Api> {
     // supportsDeveloperRole=false for opencode.ai, so the system slot is
     // unchanged either way).
     reasoning,
+    ...(isResponses ? { thinkingLevelMap: { off: null } } : {}),
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -153,6 +172,7 @@ export class ZenAdapter {
   readonly #provider: { streamSimple(model: unknown, context: unknown, options: unknown): unknown }
   readonly #firstEventMs: number
   readonly #bodyIdleMs: number
+  readonly #responsesBodyIdleMs: number
 
   constructor(catalog: CatalogLike, options: {
     zenBaseUrl?: string
@@ -160,10 +180,12 @@ export class ZenAdapter {
     /** Watchdog windows (tests inject short ones; defaults are live-tuned). */
     firstEventMs?: number
     bodyIdleMs?: number
+    responsesBodyIdleMs?: number
   } = {}) {
     this.#catalog = catalog
     this.#firstEventMs = options.firstEventMs ?? DEFAULT_FIRST_EVENT_MS
     this.#bodyIdleMs = options.bodyIdleMs ?? DEFAULT_BODY_IDLE_MS
+    this.#responsesBodyIdleMs = options.responsesBodyIdleMs ?? (options.bodyIdleMs !== undefined ? options.bodyIdleMs : RESPONSES_BODY_IDLE_MS)
     if (options.providerOverride !== undefined) {
       this.#provider = options.providerOverride as never
       return
@@ -180,7 +202,10 @@ export class ZenAdapter {
         },
       },
       models: [],
-      api: openaiCompletions,
+      api: {
+        'openai-completions': openaiCompletions,
+        'openai-responses': openaiResponses,
+      },
     })
   }
 
@@ -273,7 +298,9 @@ export class ZenAdapter {
     // behind the pending request), so timeout-promise racing is the only
     // mechanism that actually interrupts a hung stream.
     const firstEventMs = this.#firstEventMs
-    const bodyIdleMs = this.#bodyIdleMs
+    const bodyIdleMs = isResponsesOnlyModel(options.model)
+      ? this.#responsesBodyIdleMs
+      : this.#bodyIdleMs
     const rotateStory: string[] = []
     for (let attempt = 0; ; attempt += 1) {
       const events = routingContext.run(contextStore, () =>
@@ -433,6 +460,7 @@ export class ZenAdapter {
     ids: ReturnType<typeof deriveRequestIDs>,
     model: ReturnType<typeof toPiModel>,
   ): unknown {
+    const isResponses = isResponsesOnlyModel(model.id)
     // Structural boundary: PiContext (own types, unit-tested) -> pi-ai Context.
     // onPayload injects the free-lane gate tools (adapter/messages.ts) into the
     // serialized body right before dispatch — plain-chat contexts carry no
@@ -441,14 +469,44 @@ export class ZenAdapter {
     // wire semantics this lane needs (selected off must SEND `none`, not omit),
     // so the effort rides the payload rewrite instead.
     const effortWire = reasoningEffortWire(options.reasoningEffort)
-    const onPayload =
-      effortWire === undefined
-        ? ensureFreeLaneShape
-        : (payload: unknown): unknown => {
-            const shaped = ensureFreeLaneShape(payload)
-            if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return shaped
-            return { ...((shaped ?? payload) as Record<string, unknown>), reasoning_effort: effortWire }
+    const onPayload = (payload: unknown): unknown => {
+      const shaped = ensureFreeLaneShape(payload)
+      if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return shaped
+      const p = { ...((shaped ?? payload) as Record<string, unknown>) } as Record<string, unknown> & {
+        reasoning?: { effort?: string; [k: string]: unknown }
+        reasoning_effort?: string
+      }
+      if (isResponses) {
+        // OpenAI Responses API (/v1/responses) uses `reasoning: { effort }`, NOT root `reasoning_effort`.
+        // Upstream rejects `reasoning_effort` with "unknown parameter reasoning_effort".
+        delete p.reasoning_effort
+
+        if (effortWire !== undefined) {
+          // Upstream muse-spark rejects 'none'; clamp 'off'/'none' to 'minimal'
+          const effort = effortWire === 'none' ? 'minimal' : effortWire
+          p.reasoning = {
+            ...(typeof p.reasoning === 'object' && p.reasoning !== null ? p.reasoning : {}),
+            effort,
           }
+        } else if (p.reasoning?.effort === 'none') {
+          // pi-ai defaults reasoning.effort to 'none' when model.reasoning is true;
+          // upstream rejects 'none', so remove it when user chose default (no effort).
+          const { effort: _unused, ...rest } = p.reasoning
+          if (Object.keys(rest).length > 0) {
+            p.reasoning = rest
+          } else {
+            delete p.reasoning
+          }
+        }
+        return p
+      }
+
+      if (effortWire !== undefined) {
+        p.reasoning_effort = effortWire
+        return p
+      }
+      return shaped
+    }
     return this.#provider.streamSimple(model, context as unknown as Context, {
       apiKey: ANONYMOUS_KEY,
       sessionId: ids.session,
