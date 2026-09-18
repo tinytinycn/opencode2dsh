@@ -1,15 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ModelCatalog } from '../src/adapter/catalog.ts'
-import {
-  DEFAULT_BODY_IDLE_MS,
-  PROVIDER_ID,
-  RESPONSES_BODY_IDLE_MS,
-  RESPONSES_THINKING_MAP,
-  ZenAdapter,
-  apiForModel,
-  isResponsesOnlyModel,
-} from '../src/adapter/zen-adapter.ts'
+import { PROVIDER_ID, reasoningEfforts, reasoningEffortWire, ZenAdapter } from '../src/adapter/zen-adapter.ts'
 
 /**
  * The exact method surface dsh-llm touches on a registered adapter. A missing
@@ -54,177 +46,128 @@ test('listModels mirrors the catalog without duplicates', () => {
   const adapter = new ZenAdapter({
     list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free'],
     decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => ({ reasoning: true, effortValues: [] }),
   })
   const models = adapter.listModels('opencode2dsh')
   assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free'])
 })
 
-test('isResponsesOnlyModel and apiForModel correctly classify muse-spark-* models', () => {
-  assert.equal(isResponsesOnlyModel('muse-spark-050'), true)
-  assert.equal(isResponsesOnlyModel('muse-spark-v1'), true)
-  assert.equal(isResponsesOnlyModel('muse-spark-deepseek'), true)
-  assert.equal(apiForModel('muse-spark-050'), 'openai-responses')
-  assert.equal(apiForModel('muse-spark-v1'), 'openai-responses')
-
-  assert.equal(isResponsesOnlyModel('big-pickle'), false)
-  assert.equal(isResponsesOnlyModel('qwen-free'), false)
-  assert.equal(isResponsesOnlyModel('deepseek-r1'), false)
-  assert.equal(apiForModel('big-pickle'), 'openai-completions')
-  assert.equal(apiForModel('qwen-free'), 'openai-completions')
-
-  assert.equal(RESPONSES_BODY_IDLE_MS, 300_000)
-  assert.equal(DEFAULT_BODY_IDLE_MS, 120_000)
+test('reasoningEfforts: declared ladder wins, none folds into off, default ladder otherwise', () => {
+  // no capability / non-reasoning model: advertise nothing
+  assert.equal(reasoningEfforts(undefined), undefined)
+  assert.equal(reasoningEfforts({ reasoning: false, effortValues: ['low'] }), undefined)
+  // reasoning without a declared ladder: the standard five the gateway accepts
+  assert.deepEqual(
+    reasoningEfforts({ reasoning: true, effortValues: [] })?.map((e) => e.id),
+    ['off', 'minimal', 'low', 'medium', 'high'],
+  )
+  // declared ladder (muse-spark shape) is offered verbatim, ladder-ordered
+  assert.deepEqual(
+    reasoningEfforts({ reasoning: true, effortValues: ['xhigh', 'low', 'medium'] })?.map((e) => e.id),
+    ['low', 'medium', 'xhigh'],
+  )
+  // metadata `none` folds into our `off`; out-of-vocabulary values drop
+  assert.deepEqual(
+    reasoningEfforts({ reasoning: true, effortValues: ['none', 'high', 'banana'] })?.map((e) => e.id),
+    ['off', 'high'],
+  )
+  // selector labels are the capitalized level names
+  assert.deepEqual(reasoningEfforts({ reasoning: true, effortValues: [] })?.[0], { id: 'off', name: 'Off' })
 })
 
-test('streamSimple routes muse-spark-* to openai-responses with reasoning', async () => {
-  let capturedModel: any
-  const fakeProvider = {
-    streamSimple: (model: unknown) => {
-      capturedModel = model
+test('reasoningEffortWire maps picker ids to the gateway spelling', () => {
+  // no selection: inject nothing (provider default keeps always-think models thinking)
+  assert.equal(reasoningEffortWire(undefined), undefined)
+  // off must SEND none — a mere omission never disables Zen's thinking models
+  assert.equal(reasoningEffortWire('off'), 'none')
+  // ladder levels pass through verbatim
+  assert.equal(reasoningEffortWire('low'), 'low')
+  assert.equal(reasoningEffortWire('xhigh'), 'xhigh')
+  // unknown ids were never advertised; inject nothing rather than risk the 400
+  assert.equal(reasoningEffortWire('banana'), undefined)
+})
+
+test('resolveModel advertises the thinking-level picker for reasoning models only', () => {
+  const adapter = new ZenAdapter({
+    list: () => ['big-pickle', 'ghost'],
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: (model: string) =>
+      model === 'big-pickle' ? { reasoning: true, effortValues: ['low', 'high'] } : undefined,
+  })
+  assert.deepEqual(
+    adapter.resolveModel('opencode2dsh', 'big-pickle').reasoning?.efforts.map((e) => e.id),
+    ['low', 'high'],
+  )
+  // unknown metadata: no reasoning field — dsh-llm then offers only the default
+  assert.equal(adapter.resolveModel('opencode2dsh', 'ghost').reasoning, undefined)
+})
+
+/** Scripted provider that records the streamSimple options it receives. */
+function capturingProvider() {
+  const captured: Array<{ onPayload?: (payload: unknown) => unknown }> = []
+  const provider = {
+    streamSimple(_model: unknown, _context: unknown, options: { onPayload?: (payload: unknown) => unknown }): AsyncIterable<{ type: string }> {
+      captured.push(options)
       return (async function* () {
-        yield { type: 'start', partial: { content: [] } }
-        yield { type: 'thinking_delta', contentIndex: 0, delta: 'pondering' }
-        yield { type: 'text_delta', contentIndex: 1, delta: 'spark output' }
-        yield {
-          type: 'done',
-          message: {
-            api: (model as any).api,
-            provider: 'opencode2dsh',
-            model: (model as any).id,
-            content: [{ type: 'thinking', thinking: 'pondering' }, { type: 'text', text: 'spark output' }],
-            usage: { input: 5, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
-            stopReason: 'stop',
-          },
-        }
+        yield { type: 'start' }
+        yield { type: 'text_delta', delta: 'hi' }
+        yield { type: 'done', message: { stopReason: 'stop', content: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 } } }
       })()
     },
   }
-  const adapter = new ZenAdapter(new ModelCatalog(), { providerOverride: fakeProvider })
-  const stream = adapter.stream({
-    provider: 'opencode2dsh',
-    model: 'muse-spark-050',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
-  })
-  const chunks = []
-  for await (const chunk of stream) chunks.push(chunk)
-  assert.equal(capturedModel.id, 'muse-spark-050')
-  assert.equal(capturedModel.api, 'openai-responses')
-  assert.equal(capturedModel.reasoning, true)
-  assert.ok(chunks.some((c) => c.type === 'reasoning-delta'))
-  assert.ok(chunks.some((c) => c.type === 'text-delta'))
-})
+  return { provider, captured }
+}
 
-test('streamSimple routes standard models to openai-completions without reasoning', async () => {
-  let capturedModel: any
-  const fakeProvider = {
-    streamSimple: (model: unknown) => {
-      capturedModel = model
-      return (async function* () {
-        yield { type: 'start', partial: { content: [] } }
-        yield { type: 'text_delta', contentIndex: 0, delta: 'regular output' }
-        yield {
-          type: 'done',
-          message: {
-            api: (model as any).api,
-            provider: 'opencode2dsh',
-            model: (model as any).id,
-            content: [{ type: 'text', text: 'regular output' }],
-            usage: { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 10 },
-            stopReason: 'stop',
-          },
-        }
-      })()
+/** A body that already satisfies the free-lane agent-shape gate. */
+const gateBody = {
+  model: 'big-pickle',
+  messages: [{ role: 'user', content: 'hi' }],
+  stream: true,
+  tools: ['bash', 'read'].map((name) => ({ type: 'function', function: { name, description: 'd', parameters: {} } })),
+}
+
+async function runStream(catalogReasoning: boolean, effort?: string): Promise<Array<{ onPayload?: (payload: unknown) => unknown }>> {
+  const { provider, captured } = capturingProvider()
+  const adapter = new ZenAdapter(
+    {
+      list: () => ['big-pickle'],
+      decision: () => ({ allowed: true, source: 'test', known: true }),
+      reasoningCapability: () => ({ reasoning: catalogReasoning, effortValues: [] }),
     },
-  }
-  const adapter = new ZenAdapter(new ModelCatalog(), { providerOverride: fakeProvider })
-  const stream = adapter.stream({
-    provider: 'opencode2dsh',
-    model: 'big-pickle',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
-  })
-  const chunks = []
-  for await (const chunk of stream) chunks.push(chunk)
-  assert.equal(capturedModel.id, 'big-pickle')
-  assert.equal(capturedModel.api, 'openai-completions')
-  assert.equal(capturedModel.reasoning, false)
+    { providerOverride: provider },
+  )
+  const options = { provider: 'opencode2dsh', model: 'big-pickle', messages: [], temperature: 0, maxTokens: 16 }
+  const stream = adapter.stream({ ...options, ...(effort !== undefined ? { reasoningEffort: effort } : {}) } as never)
+  for await (const chunk of stream) void chunk
+  return captured
+}
+
+test('stream injects the selected reasoning_effort into the outgoing body', async () => {
+  // off -> wire none (the only spelling that stops the always-think models)
+  const offOptions = (await runStream(true, 'off'))[0]!
+  assert.deepEqual(offOptions.onPayload?.({ ...gateBody }), { ...gateBody, reasoning_effort: 'none' })
+
+  // ladder levels ride verbatim
+  const lowOptions = (await runStream(true, 'low'))[0]!
+  assert.deepEqual(lowOptions.onPayload?.({ ...gateBody }), { ...gateBody, reasoning_effort: 'low' })
+
+  // no selection: the onPayload stays the plain gate shaper (a gate-satisfied
+  // body needs no rewrite -> undefined, and no effort field is ever added)
+  const defaultOptions = (await runStream(true))[0]!
+  assert.equal(defaultOptions.onPayload?.({ ...gateBody }), undefined)
 })
 
-test('muse-spark-* model defines thinkingLevelMap with off: null and valid effort levels', async () => {
-  let capturedModel: any
-  const fakeProvider = {
-    streamSimple: (model: unknown) => {
-      capturedModel = model
-      return (async function* () {
-        yield { type: 'start', partial: { content: [] } }
-        yield { type: 'done', message: { content: [], usage: {}, stopReason: 'stop' } }
-      })()
-    },
-  }
-  const adapter = new ZenAdapter(new ModelCatalog(), { providerOverride: fakeProvider })
-  const stream = adapter.stream({
-    provider: 'opencode2dsh',
-    model: 'muse-spark-1.3-contributor',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
-  })
-  for await (const _ of stream) {}
-  assert.equal(capturedModel.reasoning, true)
-  assert.deepEqual(capturedModel.thinkingLevelMap, RESPONSES_THINKING_MAP)
-  assert.equal(capturedModel.thinkingLevelMap.off, null)
-  assert.equal(capturedModel.thinkingLevelMap.minimal, 'minimal')
-  assert.equal(capturedModel.thinkingLevelMap.low, 'low')
-  assert.equal(capturedModel.thinkingLevelMap.medium, 'medium')
-  assert.equal(capturedModel.thinkingLevelMap.high, 'high')
-  assert.equal(capturedModel.thinkingLevelMap.xhigh, 'xhigh')
-  assert.equal(capturedModel.thinkingLevelMap.max, 'max')
+test('stream keeps the free-lane gate rewrite alongside the effort injection', async () => {
+  // a body missing the gate tools gets them AND the effort in one rewrite
+  const offOptions = (await runStream(true, 'off'))[0]!
+  const shaped = offOptions.onPayload?.({ model: 'big-pickle', messages: [], stream: true }) as Record<string, unknown>
+  assert.equal(shaped.reasoning_effort, 'none')
+  assert.deepEqual(
+    (shaped.tools as Array<{ function: { name: string } }>).map((t) => t.function.name).sort(),
+    ['bash', 'read'],
+  )
+  assert.equal(shaped.tool_choice, 'none')
+
+  // non-chat payloads pass through untouched even with an effort selected
+  assert.equal(offOptions.onPayload?.(null), undefined)
 })
-
-test('reasoning effort "none" or "off" is sanitized to "minimal" for muse-spark-*', async () => {
-  let capturedOptions: any
-  const fakeProvider = {
-    streamSimple: (_model: unknown, _context: unknown, options: unknown) => {
-      capturedOptions = options
-      return (async function* () {
-        yield { type: 'start', partial: { content: [] } }
-        yield { type: 'done', message: { content: [], usage: {}, stopReason: 'stop' } }
-      })()
-    },
-  }
-  const adapter = new ZenAdapter(new ModelCatalog(), { providerOverride: fakeProvider })
-
-  // Test reasoningEffort: 'none'
-  const streamNone = adapter.stream({
-    provider: 'opencode2dsh',
-    model: 'muse-spark-1.3-contributor',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
-    reasoningEffort: 'none',
-  })
-  for await (const _ of streamNone) {}
-  assert.equal(capturedOptions.reasoning, 'minimal')
-
-  // Test reasoningEffort: 'off'
-  const streamOff = adapter.stream({
-    provider: 'opencode2dsh',
-    model: 'muse-spark-1.3-contributor',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
-    reasoningEffort: 'off',
-  })
-  for await (const _ of streamOff) {}
-  assert.equal(capturedOptions.reasoning, 'minimal')
-
-  // Test valid effort: 'high'
-  const streamHigh = adapter.stream({
-    provider: 'opencode2dsh',
-    model: 'muse-spark-1.3-contributor',
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'test' }] }],
-    reasoningEffort: 'high',
-  })
-  for await (const _ of streamHigh) {}
-  assert.equal(capturedOptions.reasoning, 'high')
-
-  // Test onPayload callback sanitizes any remaining effort: 'none'
-  const payloadWithEffortNone = { reasoning: { effort: 'none' }, reasoning_effort: 'none' }
-  const sanitized = capturedOptions.onPayload(payloadWithEffortNone)
-  assert.equal(sanitized.reasoning.effort, 'minimal')
-  assert.equal(sanitized.reasoning_effort, 'minimal')
-})
-

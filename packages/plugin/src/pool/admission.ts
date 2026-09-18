@@ -19,6 +19,7 @@
 import type { Dispatcher } from 'undici'
 
 import { ZEN_BASE_URL } from '../adapter/catalog.ts'
+import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from '../adapter/messages.ts'
 import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
 import { gradeOf, type ExitNode, type ExitPool } from './pool.ts'
 
@@ -195,7 +196,9 @@ export async function admitCandidate(
   // adapter sends, or every candidate fails step 4 regardless of exit
   // quality (a full refill round admitted 0 of 701 tunnel-OK survivors).
   // Per-candidate ids: the upstream correlates sessions with exits, so a
-  // probe session must not collide with real adapter sessions.
+  // probe session must not collide with real adapter sessions. The canonical
+  // mapping (ids.ts) is mandatory here too — the old 24-hex probe sessions
+  // drew 403 FreeTierError on the free lane like every other foreign shape.
   const probeHeaders = disguiseHeaders({
     session: canonicalSessionID(`admission:${candidate.address}`),
     request: randomID('req', 16),
@@ -240,7 +243,10 @@ export async function admitCandidate(
       return { admitted: false, reason: `zen models HTTP ${models.statusCode}` }
     }
 
-    // Step 4: anonymous-lane smoke (1 token, non-streaming).
+    // Step 4: anonymous-lane smoke (streaming, 1 token). The free lane
+    // rejects non-streaming bodies outright and wants the agent-shape gate
+    // tools in the body (adapter/messages.ts, live-probed 2026-09-18) — a
+    // bare 1-token probe 403s like every toolless chat.
     const smoke = await request(`${zenBase.replace(/\/+$/, '')}/v1/chat/completions`, {
       method: 'POST',
       headers: {
@@ -250,7 +256,15 @@ export async function admitCandidate(
         'x-opencode-client': 'cli',
         ...probeHeaders,
       },
-      body: JSON.stringify({ model: smokeModel, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
+      body: JSON.stringify({
+        model: smokeModel,
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 1,
+        stream: true,
+        stream_options: { include_usage: true },
+        tools: FREE_LANE_GATE_TOOL_NAMES.map((name) => freeLaneGateTool(name)),
+        tool_choice: 'none',
+      }),
     })
     if (smoke.statusCode !== 200) {
       // 429 = the exit is good (alive + tunnel verified) but its anonymous

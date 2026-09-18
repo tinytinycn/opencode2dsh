@@ -43,7 +43,7 @@
   },
   "scripts": {
     "build": "tsdown src/index.ts --format esm --dts --out-dir lib --no-clean",
-    "prepack": "pnpm build && pnpm build:client && node ../../scripts/prepare-package.mjs",
+    "prepack": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\" && pnpm build && pnpm build:client && node ../../scripts/prepare-package.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/*.test.ts\"",
     "build:client": "tsdown -c tsdown.client.config.ts"

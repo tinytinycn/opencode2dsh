@@ -2,27 +2,30 @@
 
 ## 0.3.3 (2026-09-18)
 
-### English
+### Added
 
-#### Fixed
+- **带推理的免费模型现在可以选择思考等级。** 在 DSH 的模型选择器中，推理模型
+  （big-pickle、mimo-v2.5-free、nemotron 系、muse-spark 系等）会出现思考等级
+  选项：模型元数据声明了档位的按声明展示（如 muse-spark 的 Minimal–Xhigh），
+  其余推理模型提供 Off/Minimal/Low/Medium/High。选 Off 会向上游发送
+  `reasoning_effort: "none"`——实测这是唯一能真正让"常思考"模型停止思考的传法
+  （只省略该字段时上游保持默认继续思考）；选具体档位原样透传；不选则请求与
+  旧版完全一致。非推理模型不出现该选项。
 
-- **Fix sessionID generation format (aligned with PR #28).**
-  Updated `canonicalSessionID` generation to match the canonical format `ses_[0-9a-f]{12}[0-9A-Za-z]{14}` (12 lowercase hex characters followed by 14 alphanumeric characters). Aligned across both Go (`legacy`) and TypeScript (`packages/plugin`) implementations with comprehensive test coverage.
-- **Support responses-only model routing and extended idle watchdog (`muse-spark-*`).**
-  Routed `muse-spark-*` models to pi-ai's `openai-responses` (`/v1/responses`) API to avoid bare 500 errors on `/chat/completions`. Extended stream body idle watchdog from 120s to 300s to accommodate reasoning bursts.
-- **Fix 400 invalid request error for `muse-spark-*` (`reasoning_effort 'none' is not supported`).**
-  Resolved an issue where pi-ai injected `reasoning: { effort: 'none' }` when reasoning was omitted or toggled off, which is rejected by upstream Console for reasoning models. Added `thinkingLevelMap` with `off: null` and `[minimal, low, medium, high, xhigh, max]` support, clamped `none`/`off` to `'minimal'`, and added an `onPayload` sanitization hook to prevent invalid reasoning efforts.
+## 0.3.2 (2026-09-18)
 
-### 中文
+### Fixed
 
-#### 修复
-
-- **修复 sessionID 格式生成问题（对齐 PR #28）。**
-  修复 `canonicalSessionID` 生成格式，更新为 `ses_[0-9a-f]{12}[0-9A-Za-z]{14}`（`ses_` 前缀加 12 位小写十六进制，后接 14 位大小写字母数字），对齐 OpenCode 上游会话规范，并在 Go（`legacy`）与 TypeScript 双端均保持一致并补齐单测。
-- **支持 Responses-only 模型路由与长思考静默（`muse-spark-*`）。**
-  针对 `muse-spark-*` 模型在 `/chat/completions` 端点返回裸 500 错误的问题，自动将其路由至 pi-ai 的 `openai-responses`（`/v1/responses`）端点，并将流式传输 Body 空闲等待超时窗口从 120 秒放宽至 300 秒，以容纳思考阶段的阵发性静默。
-- **修复 `muse-spark-*` 模型报 `reasoning_effort 'none' is not supported` 400 错误。**
-  修复 pi-ai 在未显式开启 reasoning 或关闭思考时自动下发 `reasoning: { effort: 'none' }` 导致上游报错的问题。通过为 responses 模型配置 `thinkingLevelMap`（标记 `off: null`）、请求选项透传与自动将 `'none'`/`'off'` 收敛至最低档位 `'minimal'`，并在 `onPayload` 钩子中增加兜底清洗，彻底解决 400 报错。
+- **免费模型全线恢复：修复 2026-09-17 起所有免费源报 `403 FreeTierError`
+  （"free tier can only be used from within OpenCode"）的问题。** 经逐项探针
+  实测，上游匿名免费通道现在有两道校验，缺一即拒：其一，会话头必须匹配
+  OpenCode 官方客户端的会话格式（原先任意 `ses_` 开头的串即可）；其二，请求体
+  必须是"智能体形态"——流式且 `tools` 里同时包含名为 `bash` 与 `read` 的
+  function 工具（描述与参数不查；纯聊天请求没有工具，故此前全部被拒）。
+  插件现在把会话标识确定性映射成官方格式（同一对话仍映射到同一会话，会话
+  亲和不受影响），并在发往上游的请求体缺失这两个工具时注入最小桩工具（纯
+  聊天附带 `tool_choice: "none"`，模型不会真的调用它们）；免费源准入冒烟
+  探测同步改为流式并携带桩工具。
 
 ## 0.3.1 (2026-09-11)
 
